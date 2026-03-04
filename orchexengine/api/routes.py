@@ -15,6 +15,8 @@ from .schemas import (
 )
 from ..router.engine import RouteEngine
 from ..utils.config import get_config
+from ..telemetry.collector import TelemetryCollector, LatencyTracker
+from ..database.session import SessionLocal
 
 router = APIRouter()
 config = get_config()
@@ -28,7 +30,16 @@ async def chat_completions(request: ChatCompletionRequest):
 
     Routes requests to local or cloud models based on routing rules.
     """
+    # Start timing
+    tracker = LatencyTracker()
+    tracker.start()
+
+    # Get routing decision
     route_decision = route_engine.select_model(request)
+    routing_info = route_engine.get_routing_info(request)
+
+    # Generate request ID
+    request_id = str(uuid.uuid4())
 
     # Get the appropriate model name for the provider
     if route_decision["target"] == "local":
@@ -42,6 +53,10 @@ async def chat_completions(request: ChatCompletionRequest):
         api_base = model_config['api_base']
         api_key = model_config['api_key']
 
+    provider = route_decision["target"]
+    routing_reason = route_decision["reason"]
+
+    db = SessionLocal()
     try:
         # Convert messages to LiteLLM format
         messages = [{"role": m.role.value, "content": m.content} for m in request.messages]
@@ -54,14 +69,44 @@ async def chat_completions(request: ChatCompletionRequest):
             max_tokens=request.max_tokens,
             stream=request.stream,
             api_base=api_base,
-            api_key = api_key
+            api_key=api_key
         )
 
         if request.stream:
-            return stream_response(response, model_name)
+            # For streaming, we log the request but don't wait for completion
+            tracker.stop()
+            telemetry = TelemetryCollector.create_telemetry(
+                request_id=request_id,
+                selected_model=model_name,
+                provider=provider,
+                latency_ms=tracker.elapsed_ms(),
+                routing_reason=routing_reason,
+                metadata={"stream": True, **routing_info.get("rules_triggered", {})},
+            )
+            TelemetryCollector.log_request(telemetry, db)
+            return stream_response(response, model_name, request_id)
 
         # Parse non-streaming response
         content = response.choices[0].message.content
+
+        # Extract token usage
+        prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+        completion_tokens = response.usage.completion_tokens if response.usage else 0
+        total_tokens = response.usage.total_tokens if response.usage else 0
+
+        # Log telemetry
+        tracker.stop()
+        telemetry = TelemetryCollector.create_telemetry(
+            request_id=request_id,
+            selected_model=model_name,
+            provider=provider,
+            latency_ms=tracker.elapsed_ms(),
+            routing_reason=routing_reason,
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            metadata={**routing_info.get("rules_triggered", {})},
+        )
+        TelemetryCollector.log_request(telemetry, db)
 
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -75,9 +120,9 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
             ],
             usage=Usage(
-                prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
-                completion_tokens=response.usage.completion_tokens if response.usage else 0,
-                total_tokens=response.usage.total_tokens if response.usage else 0
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens
             )
         )
 
@@ -87,6 +132,8 @@ async def chat_completions(request: ChatCompletionRequest):
             # Try cloud model as fallback
             model_config = config["models"]["cloud"]
             model_name = f"{model_config['provider']}/{model_config['model']}"
+            fallback_provider = "cloud"
+            fallback_reason = f"Fallback from local: {str(e)}"
 
             response = completion(
                 model=model_name,
@@ -96,7 +143,40 @@ async def chat_completions(request: ChatCompletionRequest):
                 stream=request.stream,
             )
 
+            if request.stream:
+                # Log streaming fallback
+                tracker.stop()
+                telemetry = TelemetryCollector.create_telemetry(
+                    request_id=request_id,
+                    selected_model=model_name,
+                    provider=fallback_provider,
+                    latency_ms=tracker.elapsed_ms(),
+                    routing_reason=fallback_reason,
+                    metadata={"stream": True, "was_fallback": True},
+                )
+                TelemetryCollector.log_request(telemetry, db)
+                return stream_response(response, model_name, request_id)
+
+            # Parse non-streaming fallback response
             content = response.choices[0].message.content
+
+            # Extract token usage
+            prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+            completion_tokens = response.usage.completion_tokens if response.usage else 0
+
+            # Log telemetry
+            tracker.stop()
+            telemetry = TelemetryCollector.create_telemetry(
+                request_id=request_id,
+                selected_model=model_name,
+                provider=fallback_provider,
+                latency_ms=tracker.elapsed_ms(),
+                routing_reason=fallback_reason,
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                metadata={"was_fallback": True},
+            )
+            TelemetryCollector.log_request(telemetry, db)
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -110,16 +190,30 @@ async def chat_completions(request: ChatCompletionRequest):
                     )
                 ],
                 usage=Usage(
-                    prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
-                    completion_tokens=response.usage.completion_tokens if response.usage else 0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
                     total_tokens=response.usage.total_tokens if response.usage else 0
                 )
             )
 
+        # Log error
+        tracker.stop()
+        telemetry = TelemetryCollector.create_telemetry(
+            request_id=request_id,
+            selected_model=model_name,
+            provider=provider,
+            latency_ms=tracker.elapsed_ms(),
+            routing_reason=routing_reason,
+            error=str(e),
+        )
+        TelemetryCollector.log_request(telemetry, db)
+
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 
-def stream_response(response, model_name: str):
+def stream_response(response, model_name: str, request_id: str = None):
     """Handle streaming response"""
     import json
 

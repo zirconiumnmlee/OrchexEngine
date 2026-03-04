@@ -9,6 +9,9 @@ dependencies = [
     "litellm>=1.82.0",
     "pyyaml>=6.0.3",
     "uvicorn[standard]>=0.41.0",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.20.0",
+    "python-dateutil>=2.9.0",
 ]
 
 [dependency-groups]
